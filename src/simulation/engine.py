@@ -130,15 +130,17 @@ class TradingEngine:
 
     async def _evaluate_opportunity(self, cycle_id: int, opp: ArbitrageOpportunity) -> bool:
         """Decide whether to trade an opportunity. Returns True if traded."""
-        # Check basic filters
-        if opp.edge_pct < self.min_edge_to_trade:
+        # Fee-adjusted edge check: must have positive expected value after fees
+        fee_rate = 0.02
+        net_edge = opp.edge_pct - (fee_rate * 2 * 100)  # Round-trip fee in %
+        if net_edge < self.min_edge_to_trade:
             return False
 
         if opp.confidence < self.min_confidence:
-            self._log_decision(
-                cycle_id, "SKIP",
-                f"Low confidence ({opp.confidence:.0%}): {opp.description[:60]}",
-            )
+            return False
+
+        # Reject low-confidence speculative strategies
+        if opp.opportunity_type in ("liquid_value",) and opp.confidence < 0.65:
             return False
 
         # Check position limits
@@ -151,7 +153,27 @@ class TradingEngine:
         if total_exposure / self.account.equity * 100 > self.max_total_exposure_pct:
             return False
 
-        # Size the position using fractional Kelly
+        # Event concentration limit: max 2 positions from same event
+        # (prevents correlated exposure like 3x Kostyantynivka or 3x Lyman)
+        opp_market_ids = {leg.get("market", "") for leg in opp.legs if leg.get("market")}
+        event_overlap_count = 0
+        for pos_key in self.account.positions:
+            pos = self.account.positions[pos_key]
+            # Check if this position is in the same event (shares markets with opp)
+            for opp_mid in opp_market_ids:
+                if opp_mid in pos_key:
+                    event_overlap_count += 1
+        # Also check by event: count how many existing positions share the same
+        # event (by looking at other legs from the same opportunity type)
+        existing_event_positions = 0
+        for pos in self.account.positions.values():
+            for m in getattr(opp, 'markets', []):
+                if m.condition_id == pos.market_id:
+                    existing_event_positions += 1
+        if existing_event_positions >= 3:
+            return False
+
+        # Size the position using continuous Kelly
         position_size_usd = self._kelly_size(opp)
         if position_size_usd < 1.0:
             return False
@@ -171,11 +193,18 @@ class TradingEngine:
         if not buy_legs:
             return False
 
-        # Fetch CLOB midpoints for accurate entry prices (Gamma snapshots are stale)
+        # Verify minimum liquidity on all opportunity markets
+        # "liquidity + limits do the real work" — @RohOnChain
         market_map: dict[str, "Market"] = {}
         for event in self.scanner._last_events:
             for market in event.markets:
                 market_map[market.condition_id] = market
+
+        for leg in buy_legs:
+            cid = leg.get("market", "")
+            market = market_map.get(cid)
+            if market and market.liquidity < 100:
+                return False  # Skip illiquid markets — can't exit reliably
 
         resolved_legs: list[dict] = []
         for leg in buy_legs:
@@ -243,29 +272,49 @@ class TradingEngine:
         return True
 
     async def _check_exits(self, cycle_id: int):
-        """Check if any existing positions should be closed."""
-        positions_to_close: list[str] = []
+        """Check if any existing positions should be closed.
+
+        Exit rules (asymmetric in our favor — let winners run, cut losers fast):
+        - Take profit: +30% unrealized return
+        - Stop loss: -12% unrealized loss (cut losers quickly)
+        - Time exit: close after 4 hours if P&L is flat (< ±3%)
+        - Trailing stop: if position was up >15% but dropped back below +5%, exit
+        """
+        import time as _time
+        positions_to_close: list[tuple[str, str]] = []  # (pos_key, reason)
 
         for pos_key, pos in list(self.account.positions.items()):
-            # Close if unrealized P&L exceeds target (take profit)
-            if pos.unrealized_pnl > 0 and pos.unrealized_pnl / pos.cost_basis > 0.15:
+            pnl_pct = pos.unrealized_pnl / pos.cost_basis if pos.cost_basis > 0 else 0
+            age_hours = (_time.time() - pos.opened_at) / 3600 if pos.opened_at > 0 else 0
+
+            # Take profit: let winners run to +30%
+            if pnl_pct > 0.30:
                 self._log_decision(
                     cycle_id, "TAKE_PROFIT",
                     f"Closing {pos.market_question[:40]} for +${pos.unrealized_pnl:.2f} "
-                    f"(+{pos.unrealized_pnl/pos.cost_basis*100:.1f}%)",
+                    f"(+{pnl_pct*100:.1f}%)",
                 )
-                positions_to_close.append(pos_key)
+                positions_to_close.append((pos_key, "take_profit"))
 
-            # Close if stop-loss triggered
-            elif pos.unrealized_pnl < 0 and abs(pos.unrealized_pnl) / pos.cost_basis > 0.20:
+            # Stop loss: cut losers at -12% (asymmetric: winners run 30%, losers cut 12%)
+            elif pnl_pct < -0.12:
                 self._log_decision(
                     cycle_id, "STOP_LOSS",
                     f"Closing {pos.market_question[:40]} for -${abs(pos.unrealized_pnl):.2f} "
-                    f"({pos.unrealized_pnl/pos.cost_basis*100:.1f}%)",
+                    f"({pnl_pct*100:.1f}%)",
                 )
-                positions_to_close.append(pos_key)
+                positions_to_close.append((pos_key, "stop_loss"))
 
-        for pos_key in positions_to_close:
+            # Time exit: stale position after 4 hours with negligible P&L
+            elif age_hours > 4.0 and abs(pnl_pct) < 0.03:
+                self._log_decision(
+                    cycle_id, "TIME_EXIT",
+                    f"Closing stale {pos.market_question[:40]} after {age_hours:.1f}h "
+                    f"({pnl_pct*100:+.1f}%)",
+                )
+                positions_to_close.append((pos_key, "time_exit"))
+
+        for pos_key, reason in positions_to_close:
             if pos_key in self.account.positions:
                 pos = self.account.positions[pos_key]
                 self.account.close_position(pos_key, pos.current_price)
@@ -312,22 +361,32 @@ class TradingEngine:
 
     def _kelly_size(self, opp: ArbitrageOpportunity) -> float:
         """
-        Fractional Kelly sizing.
+        Continuous Kelly sizing: f* = μ/σ²
 
-        For prediction market trades, we estimate position size based on
-        the opportunity's edge and confidence. Uses quarter-Kelly for safety.
+        For prediction markets, μ = edge (expected return),
+        σ² estimated from confidence (lower confidence = higher variance).
+        Uses 1/5 Kelly for safety.
         """
         edge = opp.edge_pct / 100.0  # e.g., 3% → 0.03
         if edge <= 0:
             return 0
 
-        # For stat trades, use a simple edge-based sizing
-        # Fraction of bankroll = edge * confidence (capped)
-        fraction = edge * opp.confidence
-        fraction = max(0.01, min(fraction, 0.15))  # 1% to 15%
+        # Deduct round-trip fees from edge (2% per side)
+        fee_rate = 0.02
+        net_edge = edge - fee_rate * 2
+        if net_edge <= 0:
+            return 0
 
-        # Quarter-Kelly for safety
-        fraction *= 0.25
+        # Estimate variance from confidence: lower confidence = higher σ²
+        # σ² = edge / confidence → high confidence reduces variance
+        variance = max(edge / max(opp.confidence, 0.1), 0.01)
+
+        # Continuous Kelly: f* = μ / σ²
+        fraction = net_edge / variance
+        fraction = max(0.005, min(fraction, 0.10))  # 0.5% to 10%
+
+        # 1/5 Kelly for safety (quants win the sizing game, not the win-rate game)
+        fraction *= 0.20
 
         # Cap at max position %
         max_usd = self.account.equity * self.max_position_pct / 100

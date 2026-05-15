@@ -72,6 +72,7 @@ class Position:
     avg_entry_price: float
     current_price: float
     unrealized_pnl: float = 0.0
+    opened_at: float = 0.0  # time.time() when position was opened
 
     @property
     def market_value(self) -> float:
@@ -206,6 +207,7 @@ class SimulatedAccount:
                         size=size,
                         avg_entry_price=price,
                         current_price=price,
+                        opened_at=time.time(),
                     )
 
             else:

@@ -354,42 +354,37 @@ class MarketScanner:
                     ))
 
         # ── Strategy 2: Liquid mid-price value bets ──
-        # Markets near 50/50 with high volume & liquidity are uncertain.
-        # These are the best markets for active trading — small edges compound.
+        # Only trade liquid markets with strong directional signals.
+        # "The real edge is filtering out trash setups" — @horizon_trade_x
+        # Require high volume AND liquidity, and only trade when price is
+        # significantly away from 0.5 (not near coin-flip territory).
         liquid_markets = [
             m for m in all_markets
-            if m.yes_price > 0 and m.liquidity > 500 and m.volume > 10000
+            if m.yes_price > 0 and m.liquidity > 2000 and m.volume > 50000
         ]
-        # Pick markets where price is between 15-85% (tradeable range)
+        # Only trade markets with clear directional signal (avoid 40-60% range)
         tradeable = [
             m for m in liquid_markets
-            if 0.15 < m.yes_price < 0.85
+            if (m.yes_price < 0.30 or m.yes_price > 0.70)
+            and 0.05 < m.yes_price < 0.95
         ]
-        # Sample a few to trade (don't overwhelm with too many)
         if tradeable:
-            random.shuffle(tradeable)
-            for m in tradeable[:3]:
-                # Determine direction: slight contrarian bias
-                # If price > 0.5, lean NO (expect regression); if < 0.5, lean YES
-                if m.yes_price > 0.55:
+            # Sort by volume (most liquid first) instead of random shuffle
+            tradeable.sort(key=lambda m: (m.volume or 0), reverse=True)
+            for m in tradeable[:2]:
+                # Only bet AGAINST extreme prices (contrarian on high-confidence outcomes)
+                # When YES > 0.70, buy NO (market overpricing YES)
+                # When YES < 0.30, buy YES (market underpricing YES)
+                if m.yes_price > 0.70:
                     side = "BUY_NO"
                     price = m.no_price if m.no_price > 0 else 1.0 - m.yes_price
-                    edge = (m.yes_price - 0.5) * 4  # scale up small edges
-                elif m.yes_price < 0.45:
+                    edge = (m.yes_price - 0.5) * 3
+                else:
                     side = "BUY_YES"
                     price = m.yes_price
-                    edge = (0.5 - m.yes_price) * 4
-                else:
-                    # Near 50/50 — pick randomly
-                    if random.random() > 0.5:
-                        side = "BUY_YES"
-                        price = m.yes_price
-                    else:
-                        side = "BUY_NO"
-                        price = m.no_price if m.no_price > 0 else 1.0 - m.yes_price
-                    edge = 2.0  # base edge for liquid uncertain markets
+                    edge = (0.5 - m.yes_price) * 3
 
-                if price <= 0 or price >= 1:
+                if price <= 0.01 or price >= 0.99:
                     continue
 
                 opportunities.append(ArbitrageOpportunity(
@@ -399,7 +394,7 @@ class MarketScanner:
                         f"@ {price:.3f} (vol=${m.volume:,.0f})"
                     ),
                     markets=[m],
-                    edge_pct=max(edge, 1.5),
+                    edge_pct=max(edge, 5.0),
                     required_capital=price * 30,
                     legs=[{
                         "market": m.condition_id,
@@ -407,16 +402,17 @@ class MarketScanner:
                         "price": price,
                         "question": m.question[:60],
                     }],
-                    confidence=0.52,
+                    confidence=0.60,  # higher threshold (was 0.52)
                 ))
 
         # ── Strategy 3: Spread capture on wide-spread markets ──
         # Markets where YES + NO > 1.02 have a fat spread — buy the cheaper side
+        # Require meaningful liquidity to ensure we can exit
         for m in all_markets:
             if m.yes_price <= 0 or m.no_price <= 0:
                 continue
             spread = m.yes_price + m.no_price - 1.0
-            if spread > 0.02 and m.liquidity > 200:
+            if spread > 0.03 and m.liquidity > 1000:
                 # Buy the cheaper side (expected to converge toward fair value)
                 if m.yes_price < m.no_price:
                     side = "BUY_YES"
