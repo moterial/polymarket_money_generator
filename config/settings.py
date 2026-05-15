@@ -35,8 +35,9 @@ class RiskConfig:
 
 @dataclass
 class AIConfig:
-    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    model: str = os.getenv("OPENAI_MODEL", "gpt-4o")
+    openai_api_key: str = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    base_url: str = os.getenv("LLM_BASE_URL", "")
+    model: str = os.getenv("LLM_MODEL_NAME", os.getenv("OPENAI_MODEL", "gpt-4o"))
 
 
 @dataclass

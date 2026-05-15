@@ -93,13 +93,14 @@ async def run_analyze():
     from src.ai.market_analyzer import AIMarketAnalyzer
 
     if not settings.ai.openai_api_key:
-        print("Error: OPENAI_API_KEY not set in .env")
+        print("Error: LLM_API_KEY (or OPENAI_API_KEY) not set in .env")
         sys.exit(1)
 
     client = PolymarketClient()
     ai = AIMarketAnalyzer(
         api_key=settings.ai.openai_api_key,
         model=settings.ai.model,
+        base_url=settings.ai.base_url,
     )
 
     print("Fetching markets...")

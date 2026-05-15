@@ -44,17 +44,21 @@ Output your analysis as structured JSON."""
 class AIMarketAnalyzer:
     """Use LLMs to detect logical relationships and pricing inconsistencies."""
 
-    def __init__(self, api_key: str = "", model: str = "gpt-4o"):
+    def __init__(self, api_key: str = "", model: str = "gpt-4o", base_url: str = ""):
         self.api_key = api_key
         self.model = model
+        self.base_url = base_url
         self._client = None
 
     def _get_client(self):
         if self._client is None:
             if not self.api_key:
-                raise ValueError("OpenAI API key not configured")
+                raise ValueError("LLM API key not configured")
             from openai import OpenAI
-            self._client = OpenAI(api_key=self.api_key)
+            kwargs = {"api_key": self.api_key}
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            self._client = OpenAI(**kwargs)
         return self._client
 
     async def analyze_event_relationships(

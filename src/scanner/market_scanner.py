@@ -72,6 +72,7 @@ class MarketScanner:
         self.ai = AIMarketAnalyzer(
             api_key=settings.ai.openai_api_key,
             model=settings.ai.model,
+            base_url=settings.ai.base_url,
         )
 
         self._last_events: list[Event] = []
