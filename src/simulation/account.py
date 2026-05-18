@@ -50,7 +50,7 @@ class Order:
         return {
             "id": self.id,
             "timestamp": self.timestamp.isoformat(),
-            "market_id": self.market_id[:16] + "..." if len(self.market_id) > 16 else self.market_id,
+            "market_id": self.market_id,
             "market_question": self.market_question,
             "side": self.side.value,
             "price": round(self.price, 4),
@@ -84,7 +84,7 @@ class Position:
 
     def to_dict(self) -> dict:
         return {
-            "market_id": self.market_id[:16] + "...",
+            "market_id": self.market_id,
             "market_question": self.market_question,
             "side": self.side,
             "size": round(self.size, 2),
@@ -138,7 +138,7 @@ class SimulatedAccount:
         price: float,
         size: float,
         reason: str = "",
-        fee_rate: float = 0.02,
+        fee_rate: float = 0.01,
     ) -> Order:
         """Place a simulated order. Immediately fills at the given price."""
         with self._lock:
@@ -240,10 +240,11 @@ class SimulatedAccount:
                 self.realized_pnl += pnl
                 self.trade_count += 1
 
-                if pnl >= 0:
+                if pnl > 0:
                     self.win_count += 1
-                else:
+                elif pnl < 0:
                     self.loss_count += 1
+                # pnl == 0 (breakeven) not counted as win or loss
 
                 order = Order(
                     id=self._gen_id(),
@@ -278,7 +279,7 @@ class SimulatedAccount:
                         pos.current_price = new_price
                         pos.unrealized_pnl = (pos.current_price - pos.avg_entry_price) * pos.size
 
-    def close_position(self, pos_key: str, current_price: float) -> Optional[Order]:
+    def close_position(self, pos_key: str, current_price: float, reason: str = "Position closed") -> Optional[Order]:
         """Close an existing position at current market price."""
         with self._lock:
             if pos_key not in self.positions:
@@ -293,7 +294,7 @@ class SimulatedAccount:
             side=side,
             price=current_price,
             size=pos.size,
-            reason="Position closed",
+            reason=reason,
         )
 
     # ── Getters ──
@@ -301,7 +302,6 @@ class SimulatedAccount:
     @property
     def equity(self) -> float:
         with self._lock:
-            unrealized = sum(p.unrealized_pnl for p in self.positions.values())
             positions_value = sum(p.market_value for p in self.positions.values())
             return self.cash_balance + positions_value
 

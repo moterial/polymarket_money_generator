@@ -55,6 +55,7 @@ class TradingEngine:
         self._scan_count = 0
         self._last_result: Optional[ScanResult] = None
         self._decision_log: list[dict] = []
+        self._recently_exited: dict[str, float] = {}  # market_id → cooldown_until timestamp
 
     @property
     def is_running(self) -> bool:
@@ -130,17 +131,28 @@ class TradingEngine:
 
     async def _evaluate_opportunity(self, cycle_id: int, opp: ArbitrageOpportunity) -> bool:
         """Decide whether to trade an opportunity. Returns True if traded."""
+        # REJECT settlement-time "arbitrage" — these multi-outcome arbs
+        # (lp_optimal, multi_outcome_buy_all_yes/no, overround_value, underround_value)
+        # only pay off at market settlement (months away). In the meantime,
+        # prices don't move and we just bleed fees on entry/exit.
+        # This was THE primary cause of money loss: fake 30-49% "edge"
+        # that's unrealizable short-term.
+        SETTLEMENT_STRATEGIES = {
+            "lp_optimal", "multi_outcome_buy_all_yes", "multi_outcome_buy_all_no",
+            "overround_value", "underround_value",
+        }
+        if opp.opportunity_type in SETTLEMENT_STRATEGIES:
+            return False
+
         # Fee-adjusted edge check: must have positive expected value after fees
-        fee_rate = 0.02
+        # Polymarket: makers pay 0%, takers ~1-2%. We simulate at midpoint,
+        # so ~1% per side is a realistic estimate.
+        fee_rate = 0.01
         net_edge = opp.edge_pct - (fee_rate * 2 * 100)  # Round-trip fee in %
         if net_edge < self.min_edge_to_trade:
             return False
 
         if opp.confidence < self.min_confidence:
-            return False
-
-        # Reject low-confidence speculative strategies
-        if opp.opportunity_type in ("liquid_value",) and opp.confidence < 0.65:
             return False
 
         # Check position limits
@@ -153,18 +165,7 @@ class TradingEngine:
         if total_exposure / self.account.equity * 100 > self.max_total_exposure_pct:
             return False
 
-        # Event concentration limit: max 2 positions from same event
-        # (prevents correlated exposure like 3x Kostyantynivka or 3x Lyman)
-        opp_market_ids = {leg.get("market", "") for leg in opp.legs if leg.get("market")}
-        event_overlap_count = 0
-        for pos_key in self.account.positions:
-            pos = self.account.positions[pos_key]
-            # Check if this position is in the same event (shares markets with opp)
-            for opp_mid in opp_market_ids:
-                if opp_mid in pos_key:
-                    event_overlap_count += 1
-        # Also check by event: count how many existing positions share the same
-        # event (by looking at other legs from the same opportunity type)
+        # Event concentration limit: max 3 positions from same event
         existing_event_positions = 0
         for pos in self.account.positions.values():
             for m in getattr(opp, 'markets', []):
@@ -172,6 +173,17 @@ class TradingEngine:
                     existing_event_positions += 1
         if existing_event_positions >= 3:
             return False
+
+        # Skip markets that were recently exited (cooldown varies by exit reason)
+        import time as _time
+        now = _time.time()
+        for leg in opp.legs:
+            mid = leg.get("market", "")
+            if mid in self._recently_exited:
+                if now < self._recently_exited[mid]:  # still in cooldown
+                    return False
+                else:
+                    del self._recently_exited[mid]  # expired, clean up
 
         # Size the position using continuous Kelly
         position_size_usd = self._kelly_size(opp)
@@ -222,15 +234,17 @@ class TradingEngine:
                     break
             if not token_id:
                 continue
-            # Fetch live midpoint
+            # Fetch live midpoint — REJECT if CLOB has no orderbook (404)
             try:
                 mid = await self.scanner.client.get_midpoint(token_id)
                 if 0 < mid < 1:
-                    resolved_legs.append({**leg, "price": mid})
+                    resolved_legs.append({**leg, "price": mid, "token_id": token_id})
                 else:
-                    resolved_legs.append(leg)  # fallback to Gamma price
-            except Exception:
-                resolved_legs.append(leg)  # fallback to Gamma price
+                    logger.debug("Skipping leg %s: midpoint %.4f out of range", cid[:16], mid)
+                    continue  # Skip — no real orderbook
+            except Exception as e:
+                logger.debug("Skipping leg %s: CLOB error %s", cid[:16], e)
+                continue  # Skip — no CLOB orderbook (404 = settled/delisted)
 
         if not resolved_legs:
             return False
@@ -274,11 +288,14 @@ class TradingEngine:
     async def _check_exits(self, cycle_id: int):
         """Check if any existing positions should be closed.
 
-        Exit rules (asymmetric in our favor — let winners run, cut losers fast):
+        Exit rules:
         - Take profit: +30% unrealized return
-        - Stop loss: -12% unrealized loss (cut losers quickly)
-        - Time exit: close after 4 hours if P&L is flat (< ±3%)
-        - Trailing stop: if position was up >15% but dropped back below +5%, exit
+        - Stop loss: -12% unrealized loss
+        - Time exit: close after 24 hours if P&L is flat (< ±3%)
+          (Was 4h — but prediction markets are slow; 4h time-exit on
+           settlement-time arb just bleeds fees with zero chance of profit)
+        - Price stale: if price hasn't changed from entry after 8h,
+          CLOB may not be updating → exit to stop holding dead positions
         """
         import time as _time
         positions_to_close: list[tuple[str, str]] = []  # (pos_key, reason)
@@ -296,7 +313,7 @@ class TradingEngine:
                 )
                 positions_to_close.append((pos_key, "take_profit"))
 
-            # Stop loss: cut losers at -12% (asymmetric: winners run 30%, losers cut 12%)
+            # Stop loss: cut losers at -12%
             elif pnl_pct < -0.12:
                 self._log_decision(
                     cycle_id, "STOP_LOSS",
@@ -305,8 +322,18 @@ class TradingEngine:
                 )
                 positions_to_close.append((pos_key, "stop_loss"))
 
-            # Time exit: stale position after 4 hours with negligible P&L
-            elif age_hours > 4.0 and abs(pnl_pct) < 0.03:
+            # Price stale detection: if current_price == entry_price after 8h,
+            # the CLOB is likely not updating this token → exit to free capital
+            elif age_hours > 8.0 and abs(pos.current_price - pos.avg_entry_price) < 0.001:
+                self._log_decision(
+                    cycle_id, "STALE_EXIT",
+                    f"Closing {pos.market_question[:40]} — price unchanged from entry "
+                    f"after {age_hours:.1f}h (CLOB likely not updating)",
+                )
+                positions_to_close.append((pos_key, "stale_exit"))
+
+            # Time exit: stale position after 24 hours with negligible P&L
+            elif age_hours > 24.0 and abs(pnl_pct) < 0.03:
                 self._log_decision(
                     cycle_id, "TIME_EXIT",
                     f"Closing stale {pos.market_question[:40]} after {age_hours:.1f}h "
@@ -314,10 +341,14 @@ class TradingEngine:
                 )
                 positions_to_close.append((pos_key, "time_exit"))
 
+        import time as _time
         for pos_key, reason in positions_to_close:
             if pos_key in self.account.positions:
                 pos = self.account.positions[pos_key]
-                self.account.close_position(pos_key, pos.current_price)
+                self.account.close_position(pos_key, pos.current_price, reason=reason)
+                # Stale exits get 2h cooldown (CLOB broken); others 30min
+                cooldown_until = _time.time() + (7200 if reason == "stale_exit" else 1800)
+                self._recently_exited[pos.market_id] = cooldown_until
 
     async def _update_positions(self, result: ScanResult):
         """Update position prices from CLOB midpoints (real-time orderbook)."""
@@ -333,31 +364,46 @@ class TradingEngine:
         # For each position, find the token_id we need to price
         # pos_key format: {condition_id}_{YES/NO}
         token_to_pos: dict[str, str] = {}  # token_id → pos_key
+        unmatched = 0
         for pos_key, pos in list(self.account.positions.items()):
             cid = pos.market_id
             side = pos.side  # "YES" or "NO"
             market = market_map.get(cid)
             if not market:
+                unmatched += 1
                 continue
             for tok in market.tokens:
                 if tok.outcome.upper() == side and tok.token_id:
                     token_to_pos[tok.token_id] = pos_key
                     break
 
+        if unmatched > 0:
+            logger.warning("Price update: %d/%d positions have no matching market in Gamma",
+                           unmatched, len(self.account.positions))
+
         if not token_to_pos:
             return
 
         # Fetch CLOB midpoints for all position tokens
         price_map: dict[str, float] = {}
+        errors = 0
         tasks = [self.scanner.client.get_midpoint(tid) for tid in token_to_pos]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for tid, mid in zip(token_to_pos, results):
             if isinstance(mid, float) and 0 < mid < 1:
                 pos_key = token_to_pos[tid]
                 price_map[pos_key] = mid
+            elif isinstance(mid, Exception):
+                errors += 1
+
+        if errors > 0:
+            logger.warning("Price update: %d/%d CLOB midpoint fetches failed",
+                           errors, len(token_to_pos))
 
         if price_map:
             self.account.update_position_prices(price_map)
+            logger.debug("Price update: updated %d/%d positions",
+                         len(price_map), len(self.account.positions))
 
     def _kelly_size(self, opp: ArbitrageOpportunity) -> float:
         """

@@ -78,6 +78,7 @@ class MarketScanner:
         self._last_events: list[Event] = []
         self._price_cache: dict[str, PriceHistory] = {}
         self._scan_count: int = 0
+        self._last_ai_time: float = 0  # timestamp of last AI call
 
     async def scan_once(self) -> ScanResult:
         """Run a single scan cycle."""
@@ -109,23 +110,28 @@ class MarketScanner:
             if stat_opps:
                 logger.info("Statistical scan: %d value opportunities", len(stat_opps))
 
-            # 4. AI analysis (if configured)
+            # 4. AI analysis (if configured, with 5-minute cooldown)
             if settings.ai.openai_api_key:
-                try:
-                    # Group related events for AI analysis
-                    tagged_events = [e for e in events if e.tags][:10]
-                    if tagged_events:
-                        result.ai_relationships = await self.ai.analyze_event_relationships(
-                            tagged_events
-                        )
-                        # Convert AI findings to opportunities
-                        ai_opps = self._convert_ai_to_opportunities(
-                            result.ai_relationships, events
-                        )
-                        result.opportunities.extend(ai_opps)
-                except Exception as e:
-                    logger.warning("AI analysis error: %s", e)
-                    result.errors.append(f"AI: {e}")
+                import time as _t
+                ai_cooldown = 300  # 5 minutes between AI calls
+                if _t.time() - self._last_ai_time >= ai_cooldown:
+                    try:
+                        tagged_events = [e for e in events if e.tags][:10]
+                        if tagged_events:
+                            result.ai_relationships = await self.ai.analyze_event_relationships(
+                                tagged_events
+                            )
+                            ai_opps = self._convert_ai_to_opportunities(
+                                result.ai_relationships, events
+                            )
+                            result.opportunities.extend(ai_opps)
+                            self._last_ai_time = _t.time()
+                    except Exception as e:
+                        logger.warning("AI analysis error: %s", e)
+                        result.errors.append(f"AI: {e}")
+                else:
+                    logger.debug("AI cooldown: skipping (last call %.0fs ago)",
+                                 _t.time() - self._last_ai_time)
 
             # 5. Fetch price histories for top markets (for GARCH/correlation)
             top_markets = sorted(
@@ -227,17 +233,38 @@ class MarketScanner:
                 if mid in market_map:
                     markets.append(market_map[mid])
 
-            if markets:
+            if not markets:
+                continue
+
+            # Build legs from the violated relationship so the engine can trade them
+            legs = []
+            rel_type = rel.get("type", "unknown")
+            for m in markets:
+                # For implication violations: buy the underpriced side
+                # Default: buy YES on cheapest market (likely underpriced)
+                if m.yes_price > 0 and m.yes_price < 0.95:
+                    side = "BUY_YES" if m.yes_price < 0.50 else "BUY_NO"
+                    price = m.yes_price if side == "BUY_YES" else (m.no_price if m.no_price > 0 else 1.0 - m.yes_price)
+                    if 0.01 < price < 0.99:
+                        legs.append({
+                            "market": m.condition_id,
+                            "side": side,
+                            "price": price,
+                            "question": m.question[:60],
+                        })
+
+            if legs:
                 opportunities.append(ArbitrageOpportunity(
-                    opportunity_type=f"ai_{rel.get('type', 'unknown')}",
+                    opportunity_type=f"ai_{rel_type}",
                     description=(
-                        f"AI-detected {rel.get('type', 'unknown')}: "
+                        f"AI-detected {rel_type}: "
                         f"{rel.get('reasoning', rel.get('constraint', 'N/A'))[:100]}"
                     ),
                     markets=markets,
                     edge_pct=edge,
                     required_capital=200.0,
-                    confidence=0.5,  # AI-detected, needs verification
+                    legs=legs,
+                    confidence=0.5,
                 ))
 
         return opportunities
@@ -316,7 +343,7 @@ class MarketScanner:
                             opportunity_type="overround_value",
                             description=(
                                 f"Overround {overround:.1f}%: '{best_mkt.question[:60]}' "
-                                f"YES@{best_mkt.yes_price:.3f} vs fair {best_mkt.yes_price/yes_sum*yes_sum:.3f}"
+                                f"YES@{best_mkt.yes_price:.3f} vs fair {best_mkt.yes_price/yes_sum:.3f}"
                             ),
                             markets=[best_mkt],
                             edge_pct=min(edge, 15.0),
@@ -379,14 +406,16 @@ class MarketScanner:
                 if m.yes_price > 0.70:
                     side = "BUY_NO"
                     price = m.no_price if m.no_price > 0 else 1.0 - m.yes_price
-                    edge = (m.yes_price - 0.5) * 3
                 else:
                     side = "BUY_YES"
                     price = m.yes_price
-                    edge = (0.5 - m.yes_price) * 3
 
                 if price <= 0.01 or price >= 0.99:
                     continue
+
+                # Edge = how far price is from the 50/50 line, scaled.
+                # More extreme prices = higher expected contrarian return.
+                edge = abs(m.yes_price - 0.5) * 20  # 5% at 0.25, 8% at 0.10
 
                 opportunities.append(ArbitrageOpportunity(
                     opportunity_type="liquid_value",
@@ -395,7 +424,7 @@ class MarketScanner:
                         f"@ {price:.3f} (vol=${m.volume:,.0f})"
                     ),
                     markets=[m],
-                    edge_pct=max(edge, 5.0),
+                    edge_pct=edge,
                     required_capital=price * 30,
                     legs=[{
                         "market": m.condition_id,
@@ -403,7 +432,7 @@ class MarketScanner:
                         "price": price,
                         "question": m.question[:60],
                     }],
-                    confidence=0.60,  # higher threshold (was 0.52)
+                    confidence=0.60,
                 ))
 
         # ── Strategy 3: Spread capture on wide-spread markets ──
